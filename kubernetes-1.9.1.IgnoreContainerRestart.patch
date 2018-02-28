@@ -1,0 +1,423 @@
+diff -aurN kubernetes-1.9.1/pkg/kubelet/cache_version/cache_version.go kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/cache_version.go
+--- kubernetes-1.9.1/pkg/kubelet/cache_version/cache_version.go	1970-01-01 08:00:00.000000000 +0800
++++ kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/cache_version.go	2018-02-28 11:38:42.302173067 +0800
+@@ -0,0 +1,142 @@
++/*
++CacheVersion, the target is to save version info to the checkpoint file.
++write checkpoint when start up. and read checkpoint when version-comparation
++*/
++
++package cache_version
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/golang/glog"
++	"k8s.io/kubernetes/pkg/version"
++)
++
++type CacheVersion struct {
++	current_version            string //depend runtime. such current_version:v1.9.1
++	current_version_start_time int64  //Unix()
++	history_version            string //depend file. such history_version:v1.7.1
++	history_version_start_time int64  //Unix()
++}
++
++var CacheVersionInfo = PCacheVersion()
++
++const (
++	DEFAULT_CACHEVERSION = "v0.0.0"
++	DEFAULT_STARTTIME    = 946656000 //  2000/01/01 00:00:00
++)
++
++func PCacheVersion() *CacheVersion {
++	var nv CacheVersion
++
++	nv.current_version = DEFAULT_CACHEVERSION
++	nv.current_version_start_time = DEFAULT_STARTTIME
++	nv.history_version = DEFAULT_CACHEVERSION
++	nv.history_version_start_time = DEFAULT_STARTTIME
++
++	return &nv
++}
++
++func CurrentVersion() string {
++	return CacheVersionInfo.current_version
++}
++
++func HistoryVersion() string {
++	return CacheVersionInfo.history_version
++}
++
++func CurrentVersionStartTime() int64 {
++	return CacheVersionInfo.current_version_start_time
++}
++
++func HistoryVersionStartTime() int64 {
++	return CacheVersionInfo.history_version_start_time
++}
++
++func GetCacheVersion() *CacheVersion {
++	return CacheVersionInfo
++}
++
++func SetCachVersion() {
++	SubCachVersion()
++}
++
++func SubCachVersion() {
++	mutex.Lock()
++	defer mutex.Unlock()
++
++	version_file := fmt.Sprintf("/%s/%s", "tmp", "cache.version.save")
++
++	exist, err := PathExists(version_file)
++	if nil != err {
++		glog.Errorf("stat version.lock.save fail!, err: '%v'", err)
++		return
++	}
++
++	if exist {
++		//file exist. set history version
++		//a. just restart kubelet and not upgrade version
++		//b. upgrade version(lower -> higher OR higher -> lower)
++		GetFileContent(version_file)
++	} else {
++		//not exist.  set current_version == history_version
++		//a. file was deleted by someone misoperation
++		//b. first setup kubelet
++		PersistVersion(version_file)
++	}
++}
++
++func GetFileContent(fname string) {
++	str, err := ReadFile(fname)
++	if err != nil {
++		return
++	}
++
++	//str = version,time
++	str = strings.Replace(str, " ", "", -1) //remove space in head-tail
++	vec := strings.Split(str, ",")
++	l := len(vec)
++	if 2 != l {
++		return
++	}
++
++	CacheVersionInfo.history_version = vec[0]
++
++	nt, err := strconv.ParseInt(vec[1], 10, 64)
++	if err == nil {
++		CacheVersionInfo.history_version_start_time = nt
++	} else {
++		glog.Errorf("parse version.lock.save fail!, err: '%v'", err)
++	}
++
++	//
++	CacheVersionInfo.current_version = version.Get().String()
++	CacheVersionInfo.current_version_start_time = time.Now().Unix()
++}
++
++func PersistVersion(fname string) {
++	var v string
++	var t int64
++
++	v = version.Get().String()
++	t = time.Now().Unix()
++
++	CacheVersionInfo.current_version = v
++	CacheVersionInfo.current_version_start_time = t
++	CacheVersionInfo.history_version = v
++	CacheVersionInfo.history_version_start_time = t
++
++	str := fmt.Sprintf("%s,%d", v, t)
++	WriteFile(fname, str)
++}
++
++var mutex sync.Mutex
++
++func CheckValidity() bool {
++	return (!ExceptionTriggered) &&
++		(DEFAULT_CACHEVERSION != CurrentVersion())
++}
+diff -aurN kubernetes-1.9.1/pkg/kubelet/cache_version/checkpoint.go kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/checkpoint.go
+--- kubernetes-1.9.1/pkg/kubelet/cache_version/checkpoint.go	1970-01-01 08:00:00.000000000 +0800
++++ kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/checkpoint.go	2018-02-28 11:38:42.302173067 +0800
+@@ -0,0 +1,100 @@
++/*
++Just wrap read and write operation that from ioutil
++*/
++
++package cache_version
++
++import (
++	"io/ioutil"
++	"os"
++
++	"github.com/golang/glog"
++)
++
++func PathExists(path string) (bool, error) {
++	var err error
++	var ret bool
++
++	Block{
++		Try: func() {
++			_, err := os.Stat(path)
++			if err == nil {
++				ret = true
++				err = nil
++				return
++			} else if os.IsNotExist(err) {
++				ret = false
++				err = nil
++				return
++			} else {
++				Throw("Oh,...")
++			}
++		},
++		Catch: func(e Exception) {
++			ExceptionTriggered = true
++			glog.Errorf("stat version.lock.save fail!, err: '%v'\n", e)
++		},
++		Finally: func() {
++		},
++	}.Do()
++
++	if err == nil {
++		return ret, nil
++	}
++
++	return false, err
++}
++
++func ReadFile(fname string) (string, error) {
++	var err error
++	var ret string
++
++	Block{
++		Try: func() {
++			b, err := ioutil.ReadFile(fname)
++			if err == nil {
++				ret = string(b)
++				err = nil
++				return
++			}
++
++			Throw("Oh,...")
++		},
++		Catch: func(e Exception) {
++			ExceptionTriggered = true
++			glog.Errorf("read version.lock.save fail!, err: '%v'\n", e)
++		},
++		Finally: func() {
++		},
++	}.Do()
++
++	if err == nil {
++		return ret, nil
++	}
++
++	return "", err
++}
++
++func WriteFile(fname string, content string) error {
++	var err error
++
++	Block{
++		Try: func() {
++			bf := []byte(content)
++			err = ioutil.WriteFile(fname, bf, 0644)
++			if err == nil {
++				return
++			}
++
++			Throw("Oh,...")
++		},
++		Catch: func(e Exception) {
++			ExceptionTriggered = true
++			glog.Errorf("write version.lock.save fail!, err: '%v', content:%s\n", e, content)
++		},
++		Finally: func() {
++		},
++	}.Do()
++
++	return err
++}
+diff -aurN kubernetes-1.9.1/pkg/kubelet/cache_version/checkpoint_test.go kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/checkpoint_test.go
+--- kubernetes-1.9.1/pkg/kubelet/cache_version/checkpoint_test.go	1970-01-01 08:00:00.000000000 +0800
++++ kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/checkpoint_test.go	2018-02-28 11:38:42.302173067 +0800
+@@ -0,0 +1,33 @@
++package cache_version
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestCheckpoint() {
++	fname := "/tmp/test.file"
++
++	b, err := PathExists(fname)
++	fmt.Println("File exist:", b)
++	fmt.Println("\n")
++
++	fmt.Println("Write File Done\n")
++	content := "#^ 01234567:v0.1.2.3$#"
++	WriteFile(fname, content)
++
++	b, err = PathExists(fname)
++	fmt.Println("File exist:", b)
++	fmt.Println("\n")
++
++	str, err := ReadFile(fname)
++	if err == nil {
++		fmt.Println("Read content:", str)
++		fmt.Println("\n")
++		str = strings.Replace(str, "#", "", -1)
++		fmt.Println("Trans content:", str)
++		fmt.Println("\n")
++	} else {
++		fmt.Println(err)
++	}
++}
+diff -aurN kubernetes-1.9.1/pkg/kubelet/cache_version/exception.go kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/exception.go
+--- kubernetes-1.9.1/pkg/kubelet/cache_version/exception.go	1970-01-01 08:00:00.000000000 +0800
++++ kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/exception.go	2018-02-28 11:38:42.302173067 +0800
+@@ -0,0 +1,38 @@
++/*
++Wrap try-catch-finally interface. so that program not panic
++*/
++
++package cache_version
++
++type Block struct {
++	Try     func()
++	Catch   func(Exception)
++	Finally func()
++}
++
++type Exception interface{}
++
++func Throw(up Exception) {
++	//exist another func to replace panic ???
++	panic(up)
++}
++
++func (tcf Block) Do() {
++	if tcf.Finally != nil {
++		defer tcf.Finally()
++	}
++	if tcf.Catch != nil {
++		defer func() {
++			if r := recover(); r != nil {
++				tcf.Catch(r)
++			}
++		}()
++	}
++	tcf.Try()
++}
++
++var ExceptionTriggered = false
++
++func IsExceptioned() bool {
++	return ExceptionTriggered
++}
+diff -aurN kubernetes-1.9.1/pkg/kubelet/cache_version/exception_test.go kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/exception_test.go
+--- kubernetes-1.9.1/pkg/kubelet/cache_version/exception_test.go	1970-01-01 08:00:00.000000000 +0800
++++ kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/cache_version/exception_test.go	2018-02-28 11:38:42.302173067 +0800
+@@ -0,0 +1,25 @@
++package cache_version
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestException(t *testing.T) {
++	fmt.Println("We started")
++
++	Block{
++		Try: func() {
++			fmt.Println("I tried")
++			Throw("Oh,...sh...")
++		},
++		Catch: func(e Exception) {
++			fmt.Printf("Caught %v\n", e)
++		},
++		Finally: func() {
++			fmt.Println("Finally...")
++		},
++	}.Do()
++
++	fmt.Println("We went on")
++}
+diff -aurN kubernetes-1.9.1/pkg/kubelet/kubelet.go kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/kubelet.go
+--- kubernetes-1.9.1/pkg/kubelet/kubelet.go	2018-02-28 12:06:29.440173067 +0800
++++ kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/kubelet.go	2018-02-28 11:38:22.930130129 +0800
+@@ -58,6 +58,7 @@
+ 	internalapi "k8s.io/kubernetes/pkg/kubelet/apis/cri"
+ 	kubeletconfiginternal "k8s.io/kubernetes/pkg/kubelet/apis/kubeletconfig"
+ 	kubeletconfigv1alpha1 "k8s.io/kubernetes/pkg/kubelet/apis/kubeletconfig/v1alpha1"
++	cacheversion "k8s.io/kubernetes/pkg/kubelet/cache_version"
+ 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
+ 	kubeletcertificate "k8s.io/kubernetes/pkg/kubelet/certificate"
+ 	"k8s.io/kubernetes/pkg/kubelet/cm"
+@@ -913,6 +914,9 @@
+ 	// Finally, put the most recent version of the config on the Kubelet, so
+ 	// people can see how it was configured.
+ 	klet.kubeletConfiguration = *kubeCfg
++
++	cacheversion.SetCachVersion()
++	glog.V(2).Infof("KUBELETE.CACHE.VERSION:%v", *(cacheversion.GetCacheVersion()))
+ 	return klet, nil
+ }
+ 
+diff -aurN kubernetes-1.9.1/pkg/kubelet/kuberuntime/kuberuntime_manager.go kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/kuberuntime/kuberuntime_manager.go
+--- kubernetes-1.9.1/pkg/kubelet/kuberuntime/kuberuntime_manager.go	2018-02-28 12:06:29.605173067 +0800
++++ kubernetes-1.9.1.IgnoreContainerRestart/pkg/kubelet/kuberuntime/kuberuntime_manager.go	2018-02-28 12:05:08.447173067 +0800
+@@ -36,6 +36,7 @@
+ 	"k8s.io/kubernetes/pkg/credentialprovider"
+ 	internalapi "k8s.io/kubernetes/pkg/kubelet/apis/cri"
+ 	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
++	cacheversion "k8s.io/kubernetes/pkg/kubelet/cache_version"
+ 	"k8s.io/kubernetes/pkg/kubelet/cm"
+ 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+ 	"k8s.io/kubernetes/pkg/kubelet/events"
+@@ -46,6 +47,7 @@
+ 	"k8s.io/kubernetes/pkg/kubelet/util/cache"
+ 	"k8s.io/kubernetes/pkg/kubelet/util/format"
+ 	utilversion "k8s.io/kubernetes/pkg/util/version"
++	"k8s.io/kubernetes/pkg/version"
+ )
+ 
+ const (
+@@ -421,6 +423,16 @@
+ }
+ 
+ func containerChanged(container *v1.Container, containerStatus *kubecontainer.ContainerStatus) (uint64, uint64, bool) {
++	if validity := cacheversion.CheckValidity(); validity {
++		rt := containerStatus.StartedAt.Unix()
++		if (cacheversion.CurrentVersion() != cacheversion.HistoryVersion()) &&
++			rt < cacheversion.CurrentVersionStartTime() {
++
++			glog.V(2).Infof("SKIP.CONTAINER-ID:%s, NAME:%s", containerStatus.ID, containerStatus.Name)
++			return containerStatus.Hash, containerStatus.Hash, false
++		}
++	}
++
+ 	expectedHash := kubecontainer.HashContainer(container)
+ 	return expectedHash, containerStatus.Hash, containerStatus.Hash != expectedHash
+ }
+@@ -440,6 +452,7 @@
+ // computePodActions checks whether the pod spec has changed and returns the changes if true.
+ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *kubecontainer.PodStatus) podActions {
+ 	glog.V(5).Infof("Syncing Pod %q: %+v", format.Pod(pod), pod)
++	glog.V(2).Infof("SyncPod.CACHE.VERSION:%v", version.Get())
+ 
+ 	createPodSandbox, attempt, sandboxID := m.podSandboxChanged(pod, podStatus)
+ 	changes := podActions{
